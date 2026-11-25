@@ -1354,9 +1354,8 @@ impl State {
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
                 crate::host::log_removal_context();
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            // Refresh the copy actually bound to the descriptor.
+            let Some((shadow, address, len)) = host.bound_buffer(index, &view) else {
                 continue;
             };
             #[cfg(feature = "diagnostics")]

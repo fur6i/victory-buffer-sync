@@ -30,7 +30,7 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    kept: Mutex<Vec<Kept>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1098,13 +1098,16 @@ impl HostHeap {
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+    fn keep(&self, index: u32, resource: Kept) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
             // this slot.
             if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
+                match old {
+                    BoundResource::Resource(resource) => crate::host::retire(resource),
+                    BoundResource::Buffer(shadow) => crate::host::retire(shadow),
+                }
             }
         }
     }
@@ -1134,7 +1137,7 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
         };
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Some(BoundResource::Resource(buffer.clone())));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -1173,7 +1176,7 @@ impl HostHeap {
                 self.cpu(index),
             )
         };
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Some(BoundResource::Resource(buffer.clone())));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -1319,13 +1322,38 @@ impl HostHeap {
         Some(view)
     }
 
+    /// The buffer and range currently bound to a directly indexed slot.
+    /// Another overlapping title buffer may have been registered since the
+    /// descriptor was made, so a new lookup may no longer find this copy.
+    pub(crate) fn bound_buffer(&self, index: u32, view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+        if !view_extent() {
+            return buffer_copy(view);
+        }
+        // Read the slot and its resource together, even if the title changed
+        // the descriptor after the caller's mirror pass.
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let key = *made.get(index as usize)?;
+        let view = view_at(key as u32, (key >> 32) as u32)?;
+        let (address, len) = buffer_range(&view)?;
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let BoundResource::Buffer(shadow) = kept.get(index as usize)?.as_ref()? else {
+            return None;
+        };
+        shadow.offset_in(address)?;
+        let len = len.min(shadow.left(address));
+        (len > 0).then(|| (shadow.clone(), address, len))
+    }
+
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
     /// resource (diagnostics: a buffer view's slot must show the host copy
     /// that is brought up to date for it).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let shown = kept.get(index as usize)?.as_ref()?;
+        let shown = match kept.get(index as usize)?.as_ref()? {
+            BoundResource::Resource(resource) => resource,
+            BoundResource::Buffer(shadow) => &shadow.buffer,
+        };
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
     }
 
@@ -1499,7 +1527,13 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 }
 
 /// The host resource a slot made by [`make`] views, if any.
-type Kept = Option<ID3D12Resource>;
+type Kept = Option<BoundResource>;
+
+#[derive(Clone)]
+enum BoundResource {
+    Resource(ID3D12Resource),
+    Buffer(std::sync::Arc<crate::shadow::Shadow>),
+}
 
 /// A structured buffer view (`first`, `count` elements of `stride` bytes,
 /// `offset` bytes into its host copy) as a raw view of the same bytes:
@@ -1623,7 +1657,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Some(BoundResource::Buffer(shadow)))
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -1699,7 +1733,7 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Some(BoundResource::Buffer(shadow)))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -1855,7 +1889,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Some(shadow.buffer.clone()))
+            Some(Some(BoundResource::Buffer(shadow)))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -1896,7 +1930,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some(Some(BoundResource::Resource(texture.clone())))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -1958,7 +1992,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some(Some(BoundResource::Resource(texture.clone())))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -2290,6 +2324,35 @@ mod tests {
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
         // a structured view the host takes as it is
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+    }
+
+    #[test]
+    fn indexed_view_refreshes_the_buffer_it_was_bound_to() {
+        let heap = HostHeap::new(false, 4).expect("host descriptor heap");
+        let base = 0x7fed_0000_0000u64;
+        let address = base + 0x2000;
+        let resource = [1, 0, 0, 0, 0x1000, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 4, 16, 0, 0]);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        let view = View::Placed(false, resource, desc);
+
+        crate::shadow::register(base as usize, base, 0x8000);
+        let original = crate::shadow::find(base, 0x8000).expect("original buffer");
+        let mut record = [0u32; 8];
+        let handle = record.as_mut_ptr() as u64;
+        super::super::record(handle, view.clone());
+        assert!(heap.mirror(1, handle, true).is_some());
+
+        crate::shadow::register(address as usize, address, 0x1000);
+        let fallback = buffer_copy(&view).expect("fresh lookup").0;
+        let (bound, from, len) = heap.bound_buffer(1, &view).expect("bound buffer");
+        crate::shadow::unregister(address as usize, address);
+        crate::shadow::unregister(base as usize, base);
+
+        assert!(!std::sync::Arc::ptr_eq(&fallback, &original));
+        assert!(std::sync::Arc::ptr_eq(&bound, &original));
+        assert_eq!((from, len), (address, 64));
     }
 
     /// The queue of textures picked by index serves the slots looked at

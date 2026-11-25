@@ -1,3 +1,46 @@
+# VIctory Buffer Sync
+
+An experimental [VIctory](https://github.com/Marvisak/VIctory) fork with a
+Direct3D 12 fix for buffers accessed through indexed descriptors. Based on
+the public [LooperSalty/victory branch](https://github.com/LooperSalty/victory/tree/anyxboxx/fork-7b0-lot5)
+at `fd021bf`.
+
+## Status (2026-11-25)
+
+| Check | Result |
+| --- | --- |
+| Indexed buffer selection | Passed on the Direct3D 12 software adapter (WARP). The test registers an overlapping buffer after creating the descriptor and checks which buffer is selected for refresh. |
+| Prologue on an earlier local build | First cell was controllable. Walls and character geometry were missing farther into the prison. Two captured frames reported 168.2 and 220.9 ms per frame (roughly 6.0 and 4.5 fps). |
+| Prologue with this patch | Visual quality, frame rate, stability, and VRAM use are pending in-game validation. |
+
+## What changed
+
+Each indexed descriptor retains the host buffer it was created with. If a
+second buffer is registered at an overlapping guest address, uploads still go
+to the buffer the descriptor actually reads. The earlier local run recorded
+descriptor and upload buffer mismatches; the link to the visible rendering
+defects remains unverified.
+
+```mermaid
+flowchart LR
+    Slot["Indexed descriptor"] --> Bound["Original host buffer"]
+    Range["Guest address range"] --> Later["Overlapping buffer registered later"]
+    Upload["Buffer refresh"] --> Bound
+```
+
+Run the synthetic test with the Direct3D 12 software adapter on Windows:
+
+```powershell
+$env:VICTORY_D3D12_WARP = '1'
+cargo test --profile diag -p victory-gpu --features diagnostics --lib indexed_view_refreshes_the_buffer_it_was_bound_to
+```
+
+## Base fork notes
+
+The following project notes are inherited from the base revision.
+
+---
+
 # victory-gta6
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
