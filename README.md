@@ -9,6 +9,7 @@ at `fd021bf`.
 
 | Check | Result |
 | --- | --- |
+| Windows build | Diagnostic build completed successfully. |
 | Indexed buffer selection | Passed on the Direct3D 12 software adapter (WARP). The test registers an overlapping buffer after creating the descriptor and checks which buffer is selected for refresh. |
 | Prologue on an earlier local build | First cell was controllable. Walls and character geometry were missing farther into the prison. Two captured frames reported 168.2 and 220.9 ms per frame (roughly 6.0 and 4.5 fps). |
 | Prologue with this patch | Visual quality, frame rate, stability, and VRAM use are pending in-game validation. |
